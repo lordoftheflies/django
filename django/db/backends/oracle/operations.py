@@ -1,28 +1,37 @@
 import datetime
 import re
 import uuid
+from functools import lru_cache
 
 from django.conf import settings
 from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.backends.utils import strip_quotes, truncate_name
+from django.db.models.expressions import Exists, ExpressionWrapper
+from django.db.models.query_utils import Q
+from django.db.utils import DatabaseError
 from django.utils import timezone
-from django.utils.encoding import force_bytes
+from django.utils.encoding import force_bytes, force_str
+from django.utils.functional import cached_property
 
 from .base import Database
-from .utils import BulkInsertMapper, InsertIdVar, Oracle_datetime
+from .utils import BulkInsertMapper, InsertVar, Oracle_datetime
 
 
 class DatabaseOperations(BaseDatabaseOperations):
-    compiler_module = "django.db.backends.oracle.compiler"
-
-    # Oracle uses NUMBER(11) and NUMBER(19) for integer fields.
+    # Oracle uses NUMBER(5), NUMBER(11), and NUMBER(19) for integer fields.
+    # SmallIntegerField uses NUMBER(11) instead of NUMBER(5), which is used by
+    # SmallAutoField, to preserve backward compatibility.
     integer_field_ranges = {
         'SmallIntegerField': (-99999999999, 99999999999),
         'IntegerField': (-99999999999, 99999999999),
         'BigIntegerField': (-9999999999999999999, 9999999999999999999),
         'PositiveSmallIntegerField': (0, 99999999999),
         'PositiveIntegerField': (0, 99999999999),
+        'SmallAutoField': (-99999, 99999),
+        'AutoField': (-99999999999, 99999999999),
+        'BigAutoField': (-9999999999999999999, 9999999999999999999),
     }
+    set_operators = {**BaseDatabaseOperations.set_operators, 'difference': 'MINUS'}
 
     # TODO: colorize this SQL code with style.SQL_KEYWORD(), etc.
     _sequence_reset_sql = """
@@ -49,16 +58,17 @@ BEGIN
 END;
 /"""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.set_operators['difference'] = 'MINUS'
+    # Oracle doesn't support string without precision; use the max string size.
+    cast_char_field_without_max_length = 'NVARCHAR2(2000)'
+    cast_data_types = {
+        'AutoField': 'NUMBER(11)',
+        'BigAutoField': 'NUMBER(19)',
+        'SmallAutoField': 'NUMBER(5)',
+        'TextField': cast_char_field_without_max_length,
+    }
 
     def cache_key_culling_sql(self):
-        return """
-            SELECT cache_key
-              FROM (SELECT cache_key, rank() OVER (ORDER BY cache_key) AS rank FROM %s)
-             WHERE rank = %%s + 1
-        """
+        return 'SELECT cache_key FROM %s ORDER BY cache_key OFFSET %%s ROWS FETCH FIRST 1 ROWS ONLY'
 
     def date_extract_sql(self, lookup_type, field_name):
         if lookup_type == 'week_day':
@@ -69,22 +79,20 @@ END;
             return "TO_CHAR(%s, 'IW')" % field_name
         elif lookup_type == 'quarter':
             return "TO_CHAR(%s, 'Q')" % field_name
+        elif lookup_type == 'iso_year':
+            return "TO_CHAR(%s, 'IYYY')" % field_name
         else:
-            # https://docs.oracle.com/database/121/SQLRF/functions067.htm#SQLRF00639
+            # https://docs.oracle.com/en/database/oracle/oracle-database/18/sqlrf/EXTRACT-datetime.html
             return "EXTRACT(%s FROM %s)" % (lookup_type.upper(), field_name)
 
-    def date_interval_sql(self, timedelta):
-        """
-        NUMTODSINTERVAL converts number to INTERVAL DAY TO SECOND literal.
-        """
-        return "NUMTODSINTERVAL(%06f, 'SECOND')" % (timedelta.total_seconds()), []
-
     def date_trunc_sql(self, lookup_type, field_name):
-        # https://docs.oracle.com/database/121/SQLRF/functions271.htm#SQLRF52058
+        # https://docs.oracle.com/en/database/oracle/oracle-database/18/sqlrf/ROUND-and-TRUNC-Date-Functions.html
         if lookup_type in ('year', 'month'):
             return "TRUNC(%s, '%s')" % (field_name, lookup_type.upper())
         elif lookup_type == 'quarter':
             return "TRUNC(%s, 'Q')" % field_name
+        elif lookup_type == 'week':
+            return "TRUNC(%s, 'IW')" % field_name
         else:
             return "TRUNC(%s)" % field_name
 
@@ -94,14 +102,28 @@ END;
     # This regexp matches all time zone names from the zoneinfo database.
     _tzname_re = re.compile(r'^[\w/:+-]+$')
 
+    def _prepare_tzname_delta(self, tzname):
+        if '+' in tzname:
+            return tzname[tzname.find('+'):]
+        elif '-' in tzname:
+            return tzname[tzname.find('-'):]
+        return tzname
+
     def _convert_field_to_tz(self, field_name, tzname):
         if not settings.USE_TZ:
             return field_name
         if not self._tzname_re.match(tzname):
             raise ValueError("Invalid time zone name: %s" % tzname)
-        # Convert from UTC to local time, returning TIMESTAMP WITH TIME ZONE
-        # and cast it back to TIMESTAMP to strip the TIME ZONE details.
-        return "CAST((FROM_TZ(%s, '0:00') AT TIME ZONE '%s') AS TIMESTAMP)" % (field_name, tzname)
+        # Convert from connection timezone to the local time, returning
+        # TIMESTAMP WITH TIME ZONE and cast it back to TIMESTAMP to strip the
+        # TIME ZONE details.
+        if self.connection.timezone_name != tzname:
+            return "CAST((FROM_TZ(%s, '%s') AT TIME ZONE '%s') AS TIMESTAMP)" % (
+                field_name,
+                self.connection.timezone_name,
+                self._prepare_tzname_delta(tzname),
+            )
+        return field_name
 
     def datetime_cast_date_sql(self, field_name, tzname):
         field_name = self._convert_field_to_tz(field_name, tzname)
@@ -118,11 +140,13 @@ END;
 
     def datetime_trunc_sql(self, lookup_type, field_name, tzname):
         field_name = self._convert_field_to_tz(field_name, tzname)
-        # https://docs.oracle.com/database/121/SQLRF/functions271.htm#SQLRF52058
+        # https://docs.oracle.com/en/database/oracle/oracle-database/18/sqlrf/ROUND-and-TRUNC-Date-Functions.html
         if lookup_type in ('year', 'month'):
             sql = "TRUNC(%s, '%s')" % (field_name, lookup_type.upper())
         elif lookup_type == 'quarter':
             sql = "TRUNC(%s, 'Q')" % field_name
+        elif lookup_type == 'week':
+            sql = "TRUNC(%s, 'IW')" % field_name
         elif lookup_type == 'day':
             sql = "TRUNC(%s)" % field_name
         elif lookup_type == 'hour':
@@ -155,27 +179,36 @@ END;
         elif internal_type in ['BooleanField', 'NullBooleanField']:
             converters.append(self.convert_booleanfield_value)
         elif internal_type == 'DateTimeField':
-            converters.append(self.convert_datetimefield_value)
+            if settings.USE_TZ:
+                converters.append(self.convert_datetimefield_value)
         elif internal_type == 'DateField':
             converters.append(self.convert_datefield_value)
         elif internal_type == 'TimeField':
             converters.append(self.convert_timefield_value)
         elif internal_type == 'UUIDField':
             converters.append(self.convert_uuidfield_value)
-        converters.append(self.convert_empty_values)
+        # Oracle stores empty strings as null. If the field accepts the empty
+        # string, undo this to adhere to the Django convention of using
+        # the empty string instead of null.
+        if expression.field.empty_strings_allowed:
+            converters.append(
+                self.convert_empty_bytes
+                if internal_type == 'BinaryField' else
+                self.convert_empty_string
+            )
         return converters
 
-    def convert_textfield_value(self, value, expression, connection, context):
+    def convert_textfield_value(self, value, expression, connection):
         if isinstance(value, Database.LOB):
             value = value.read()
         return value
 
-    def convert_binaryfield_value(self, value, expression, connection, context):
+    def convert_binaryfield_value(self, value, expression, connection):
         if isinstance(value, Database.LOB):
             value = force_bytes(value.read())
         return value
 
-    def convert_booleanfield_value(self, value, expression, connection, context):
+    def convert_booleanfield_value(self, value, expression, connection):
         if value in (0, 1):
             value = bool(value)
         return value
@@ -184,44 +217,50 @@ END;
     # DATE and TIMESTAMP columns, but Django wants to see a
     # python datetime.date, .time, or .datetime.
 
-    def convert_datetimefield_value(self, value, expression, connection, context):
+    def convert_datetimefield_value(self, value, expression, connection):
         if value is not None:
-            if settings.USE_TZ:
-                value = timezone.make_aware(value, self.connection.timezone)
+            value = timezone.make_aware(value, self.connection.timezone)
         return value
 
-    def convert_datefield_value(self, value, expression, connection, context):
+    def convert_datefield_value(self, value, expression, connection):
         if isinstance(value, Database.Timestamp):
             value = value.date()
         return value
 
-    def convert_timefield_value(self, value, expression, connection, context):
+    def convert_timefield_value(self, value, expression, connection):
         if isinstance(value, Database.Timestamp):
             value = value.time()
         return value
 
-    def convert_uuidfield_value(self, value, expression, connection, context):
+    def convert_uuidfield_value(self, value, expression, connection):
         if value is not None:
             value = uuid.UUID(value)
         return value
 
-    def convert_empty_values(self, value, expression, connection, context):
-        # Oracle stores empty strings as null. We need to undo this in
-        # order to adhere to the Django convention of using the empty
-        # string instead of null, but only if the field accepts the
-        # empty string.
-        field = expression.output_field
-        if value is None and field.empty_strings_allowed:
-            value = ''
-            if field.get_internal_type() == 'BinaryField':
-                value = b''
-        return value
+    @staticmethod
+    def convert_empty_string(value, expression, connection):
+        return '' if value is None else value
+
+    @staticmethod
+    def convert_empty_bytes(value, expression, connection):
+        return b'' if value is None else value
 
     def deferrable_sql(self):
         return " DEFERRABLE INITIALLY DEFERRED"
 
-    def fetch_returned_insert_id(self, cursor):
-        return int(cursor._insert_id_var.getvalue())
+    def fetch_returned_insert_columns(self, cursor, returning_params):
+        for param in returning_params:
+            value = param.get_value()
+            if value is None or value == []:
+                # cx_Oracle < 6.3 returns None, >= 6.3 returns empty list.
+                raise DatabaseError(
+                    'The database did not return a new row id. Probably '
+                    '"ORA-1403: no data found" was raised internally but was '
+                    'hidden by the Oracle OCI library (see '
+                    'https://code.djangoproject.com/ticket/28859).'
+                )
+            # cx_Oracle < 7 returns value, >= 7 returns list with single value.
+            yield value[0] if isinstance(value, list) else value
 
     def field_cast_sql(self, db_type, internal_type):
         if db_type and db_type.endswith('LOB'):
@@ -229,13 +268,30 @@ END;
         else:
             return "%s"
 
+    def no_limit_value(self):
+        return None
+
+    def limit_offset_sql(self, low_mark, high_mark):
+        fetch, offset = self._get_limit_offset_params(low_mark, high_mark)
+        return ' '.join(sql for sql in (
+            ('OFFSET %d ROWS' % offset) if offset else None,
+            ('FETCH FIRST %d ROWS ONLY' % fetch) if fetch else None,
+        ) if sql)
+
     def last_executed_query(self, cursor, sql, params):
         # https://cx-oracle.readthedocs.io/en/latest/cursor.html#Cursor.statement
         # The DB API definition does not define this attribute.
         statement = cursor.statement
-        # Unlike Psycopg's `query` and MySQLdb`'s `_last_executed`, CxOracle's
-        # `statement` doesn't contain the query parameters. refs #20010.
-        return super().last_executed_query(cursor, statement, params)
+        # Unlike Psycopg's `query` and MySQLdb`'s `_executed`, cx_Oracle's
+        # `statement` doesn't contain the query parameters. Substitute
+        # parameters manually.
+        if isinstance(params, (tuple, list)):
+            for i, param in enumerate(params):
+                statement = statement.replace(':arg%d' % i, force_str(param, errors='replace'))
+        elif isinstance(params, dict):
+            for key, param in params.items():
+                statement = statement.replace(':%s' % key, force_str(param, errors='replace'))
+        return statement
 
     def last_insert_id(self, cursor, table_name, pk_name):
         sq_name = self._get_sequence_name(cursor, strip_quotes(table_name), pk_name)
@@ -287,16 +343,23 @@ END;
             match_option = "'i'"
         return 'REGEXP_LIKE(%%s, %%s, %s)' % match_option
 
-    def return_insert_id(self):
-        return "RETURNING %s INTO %%s", (InsertIdVar(),)
+    def return_insert_columns(self, fields):
+        if not fields:
+            return '', ()
+        field_names = []
+        params = []
+        for field in fields:
+            field_names.append('%s.%s' % (
+                self.quote_name(field.model._meta.db_table),
+                self.quote_name(field.column),
+            ))
+            params.append(InsertVar(field))
+        return 'RETURNING %s INTO %s' % (
+            ', '.join(field_names),
+            ', '.join(['%s'] * len(params)),
+        ), tuple(params)
 
-    def savepoint_create_sql(self, sid):
-        return "SAVEPOINT " + self.quote_name(sid)
-
-    def savepoint_rollback_sql(self, sid):
-        return "ROLLBACK TO SAVEPOINT " + self.quote_name(sid)
-
-    def _foreign_key_constraints(self, table_name, recursive=False):
+    def __foreign_key_constraints(self, table_name, recursive):
         with self.connection.cursor() as cursor:
             if recursive:
                 cursor.execute("""
@@ -328,6 +391,12 @@ END;
                         AND cons.table_name = UPPER(%s)
                 """, (table_name,))
             return cursor.fetchall()
+
+    @cached_property
+    def _foreign_key_constraints(self):
+        # 512 is large enough to fit the ~330 tables (as of this writing) in
+        # Django's test suite.
+        return lru_cache(maxsize=512)(self.__foreign_key_constraints)
 
     def sql_flush(self, style, tables, sequences, allow_cascade=False):
         if tables:
@@ -511,8 +580,7 @@ END;
         AutoFields that aren't Oracle identity columns.
         """
         name_length = self.max_name_length() - 3
-        sequence_name = '%s_SQ' % strip_quotes(table)
-        return truncate_name(sequence_name, name_length).upper()
+        return '%s_SQ' % truncate_name(strip_quotes(table), name_length).upper()
 
     def _get_sequence_name(self, cursor, table, pk_name):
         cursor.execute("""
@@ -548,5 +616,22 @@ END;
         if internal_type == 'DateField':
             lhs_sql, lhs_params = lhs
             rhs_sql, rhs_params = rhs
-            return "NUMTODSINTERVAL(%s - %s, 'DAY')" % (lhs_sql, rhs_sql), lhs_params + rhs_params
+            return "NUMTODSINTERVAL(TO_NUMBER(%s - %s), 'DAY')" % (lhs_sql, rhs_sql), lhs_params + rhs_params
         return super().subtract_temporals(internal_type, lhs, rhs)
+
+    def bulk_batch_size(self, fields, objs):
+        """Oracle restricts the number of parameters in a query."""
+        if fields:
+            return self.connection.features.max_query_params // len(fields)
+        return len(objs)
+
+    def conditional_expression_supported_in_where_clause(self, expression):
+        """
+        Oracle supports only EXISTS(...) or filters in the WHERE clause, others
+        must be compared with True.
+        """
+        if isinstance(expression, Exists):
+            return True
+        if isinstance(expression, ExpressionWrapper) and isinstance(expression.expression, Q):
+            return True
+        return False

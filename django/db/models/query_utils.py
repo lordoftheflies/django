@@ -16,7 +16,7 @@ from django.utils import tree
 # PathInfo is used when converting lookups (fk__somecol). The contents
 # describe the relation in Model terms (model Options and Fields for both
 # sides of the relation. The join_field is the field backing the relation.
-PathInfo = namedtuple('PathInfo', 'from_opts to_opts target_fields join_field m2m direct')
+PathInfo = namedtuple('PathInfo', 'from_opts to_opts target_fields join_field m2m direct filtered_relation')
 
 
 class InvalidQuery(Exception):
@@ -53,11 +53,10 @@ class Q(tree.Node):
     AND = 'AND'
     OR = 'OR'
     default = AND
+    conditional = True
 
-    def __init__(self, *args, **kwargs):
-        connector = kwargs.pop('_connector', None)
-        negated = kwargs.pop('_negated', False)
-        super().__init__(children=list(args) + list(kwargs.items()), connector=connector, negated=negated)
+    def __init__(self, *args, _connector=None, _negated=False, **kwargs):
+        super().__init__(children=[*args, *sorted(kwargs.items())], connector=_connector, negated=_negated)
 
     def _combine(self, other, conn):
         if not isinstance(other, Q):
@@ -97,13 +96,16 @@ class Q(tree.Node):
 
     def deconstruct(self):
         path = '%s.%s' % (self.__class__.__module__, self.__class__.__name__)
+        if path.startswith('django.db.models.query_utils'):
+            path = path.replace('django.db.models.query_utils', 'django.db.models')
         args, kwargs = (), {}
         if len(self.children) == 1 and not isinstance(self.children[0], Q):
             child = self.children[0]
             kwargs = {child[0]: child[1]}
         else:
             args = tuple(self.children)
-            kwargs = {'_connector': self.connector}
+            if self.connector != self.default:
+                kwargs = {'_connector': self.connector}
         if self.negated:
             kwargs['_negated'] = True
         return path, args, kwargs
@@ -114,8 +116,8 @@ class DeferredAttribute:
     A wrapper for a deferred-loading field. When the value is read from this
     object the first time, the query is executed.
     """
-    def __init__(self, field_name, model):
-        self.field_name = field_name
+    def __init__(self, field):
+        self.field = field
 
     def __get__(self, instance, cls=None):
         """
@@ -125,26 +127,26 @@ class DeferredAttribute:
         if instance is None:
             return self
         data = instance.__dict__
-        if data.get(self.field_name, self) is self:
+        field_name = self.field.attname
+        if data.get(field_name, self) is self:
             # Let's see if the field is part of the parent chain. If so we
             # might be able to reuse the already loaded value. Refs #18343.
-            val = self._check_parent_chain(instance, self.field_name)
+            val = self._check_parent_chain(instance)
             if val is None:
-                instance.refresh_from_db(fields=[self.field_name])
-                val = getattr(instance, self.field_name)
-            data[self.field_name] = val
-        return data[self.field_name]
+                instance.refresh_from_db(fields=[field_name])
+                val = getattr(instance, field_name)
+            data[field_name] = val
+        return data[field_name]
 
-    def _check_parent_chain(self, instance, name):
+    def _check_parent_chain(self, instance):
         """
         Check if the field value can be fetched from a parent field already
         loaded in the instance. This can be done if the to-be fetched
         field is a primary key field.
         """
         opts = instance._meta
-        f = opts.get_field(name)
-        link_field = opts.get_ancestor_link(f.model)
-        if f.primary_key and f != link_field:
+        link_field = opts.get_ancestor_link(self.field.model)
+        if self.field.primary_key and self.field != link_field:
             return getattr(instance, link_field.attname)
         return None
 
@@ -258,7 +260,7 @@ def refs_expression(lookup_parts, annotations):
     Because the LOOKUP_SEP is contained in the default annotation names, check
     each prefix of the lookup_parts for a match.
     """
-    for n in range(len(lookup_parts) + 1):
+    for n in range(1, len(lookup_parts) + 1):
         level_n_lookup = LOOKUP_SEP.join(lookup_parts[0:n])
         if level_n_lookup in annotations and annotations[level_n_lookup]:
             return annotations[level_n_lookup], lookup_parts[n:]
@@ -281,7 +283,7 @@ def check_rel_lookup_compatibility(model, target_opts, field):
     # If the field is a primary key, then doing a query against the field's
     # model is ok, too. Consider the case:
     # class Restaurant(models.Model):
-    #     place = OnetoOneField(Place, primary_key=True):
+    #     place = OneToOneField(Place, primary_key=True):
     # Restaurant.objects.filter(pk__in=Restaurant.objects.all()).
     # If we didn't have the primary key check, then pk__in (== place__in) would
     # give Place's opts as the target opts, but Restaurant isn't compatible
@@ -291,3 +293,44 @@ def check_rel_lookup_compatibility(model, target_opts, field):
         check(target_opts) or
         (getattr(field, 'primary_key', False) and check(field.model._meta))
     )
+
+
+class FilteredRelation:
+    """Specify custom filtering in the ON clause of SQL joins."""
+
+    def __init__(self, relation_name, *, condition=Q()):
+        if not relation_name:
+            raise ValueError('relation_name cannot be empty.')
+        self.relation_name = relation_name
+        self.alias = None
+        if not isinstance(condition, Q):
+            raise ValueError('condition argument must be a Q() instance.')
+        self.condition = condition
+        self.path = []
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, self.__class__) and
+            self.relation_name == other.relation_name and
+            self.alias == other.alias and
+            self.condition == other.condition
+        )
+
+    def clone(self):
+        clone = FilteredRelation(self.relation_name, condition=self.condition)
+        clone.alias = self.alias
+        clone.path = self.path[:]
+        return clone
+
+    def resolve_expression(self, *args, **kwargs):
+        """
+        QuerySet.annotate() only accepts expression-like arguments
+        (with a resolve_expression() method).
+        """
+        raise NotImplementedError('FilteredRelation.resolve_expression() is unused.')
+
+    def as_sql(self, compiler, connection):
+        # Resolve the condition in Join.filtered_relation.
+        query = compiler.query
+        where = query.build_filtered_relation_q(self.condition, reuse=set(self.path))
+        return compiler.compile(where)
